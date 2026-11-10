@@ -1,0 +1,891 @@
+############################################################
+# Shiny app for rolling-window city price correlations
+############################################################
+
+rm(list = ls())
+
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(maps)
+library(scales)
+
+##----------------------------------------------------------
+## 0. File paths
+##----------------------------------------------------------
+
+data_dir <- "/Users/alexkucera/Dropbox/Stride_Detailed_Analysis/data"
+
+correlation_file <- file.path(
+  data_dir,
+  "rolling_15_year_correlations",
+  "all_rolling_correlations.rds"
+)
+
+city_geo_file <- file.path(
+  "/Users/alexkucera/Dropbox/Stride_Detailed_Analysis",
+  "margret_initial_analysis",
+  "locations_with_coords.csv"
+)
+
+##----------------------------------------------------------
+## 1. Load rolling correlations
+##----------------------------------------------------------
+
+rolling_correlations <- readRDS(correlation_file) %>%
+  mutate(
+    Window_start = as.integer(Window_start),
+    Window_end = as.integer(Window_end),
+    Window_label = as.character(Window_label),
+    
+    City1 = City1 %>%
+      str_squish() %>%
+      str_replace("\\s*,?\\s+([A-Za-z]{2})$", ", \\1"),
+    
+    City2 = City2 %>%
+      str_squish() %>%
+      str_replace("\\s*,?\\s+([A-Za-z]{2})$", ", \\1"),
+    
+    State1 = str_extract(City1, "[A-Za-z]{2}$") %>%
+      str_to_upper(),
+    
+    State2 = str_extract(City2, "[A-Za-z]{2}$") %>%
+      str_to_upper()
+  ) %>%
+  filter(
+    N_paired_years >= 10,
+    !is.na(Correlation),
+    is.finite(Correlation)
+  )
+
+##----------------------------------------------------------
+## 2. Load and clean city coordinates
+##----------------------------------------------------------
+
+city_geo <- read.csv(
+  city_geo_file,
+  stringsAsFactors = FALSE
+) %>%
+  transmute(
+    City = mylocations %>%
+      str_squish() %>%
+      str_replace("\\s*,?\\s+([A-Za-z]{2})$", ", \\1"),
+    
+    lat = as.numeric(latitude),
+    long = as.numeric(longitude)
+  ) %>%
+  filter(
+    !is.na(City),
+    !is.na(lat),
+    !is.na(long)
+  ) %>%
+  distinct(
+    City,
+    .keep_all = TRUE
+  )
+
+##----------------------------------------------------------
+## 3. Add coordinates to both cities
+##----------------------------------------------------------
+
+rolling_correlations <- rolling_correlations %>%
+  left_join(
+    city_geo %>%
+      rename(
+        City1 = City,
+        lat1 = lat,
+        long1 = long
+      ),
+    by = "City1",
+    relationship = "many-to-one"
+  ) %>%
+  left_join(
+    city_geo %>%
+      rename(
+        City2 = City,
+        lat2 = lat,
+        long2 = long
+      ),
+    by = "City2",
+    relationship = "many-to-one"
+  )
+
+# Report city names that do not have coordinates.
+missing_city_coordinates <- rolling_correlations %>%
+  select(
+    City1,
+    City2,
+    lat1,
+    long1,
+    lat2,
+    long2
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = c(".value", "city_number"),
+    names_pattern = "(City|lat|long)([12])"
+  ) %>%
+  filter(
+    is.na(lat) | is.na(long)
+  ) %>%
+  distinct(City)
+
+if (nrow(missing_city_coordinates) > 0) {
+  message("Cities missing coordinates:")
+  print(missing_city_coordinates)
+}
+
+# Connections cannot be mapped unless both cities have coordinates.
+rolling_correlations <- rolling_correlations %>%
+  filter(
+    !is.na(lat1),
+    !is.na(long1),
+    !is.na(lat2),
+    !is.na(long2)
+  )
+
+if (nrow(rolling_correlations) == 0) {
+  stop(
+    "No mappable correlation pairs remain after joining city coordinates."
+  )
+}
+
+##----------------------------------------------------------
+## 4. Available rolling windows
+##----------------------------------------------------------
+
+available_windows <- rolling_correlations %>%
+  distinct(
+    Window_start,
+    Window_end,
+    Window_label
+  ) %>%
+  arrange(Window_start)
+
+window_start_values <- available_windows$Window_start
+
+minimum_window_start <- min(window_start_values)
+maximum_window_start <- max(window_start_values)
+
+##----------------------------------------------------------
+## 5. Map data and formatting
+##----------------------------------------------------------
+
+us_map <- map_data("state")
+world_map <- map_data("world")
+
+lon_min <- -125
+lon_max <- -60
+lat_min <- 20
+lat_max <- 50
+
+world_sub <- world_map %>%
+  filter(
+    long >= lon_min,
+    long <= lon_max,
+    lat >= lat_min,
+    lat <= lat_max
+  )
+
+base_theme <- theme_minimal(
+  base_family = "Times New Roman"
+) +
+  theme(
+    panel.border = element_rect(
+      color = "black",
+      fill = NA,
+      linewidth = 0.5
+    ),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    plot.title = element_text(
+      size = 12,
+      face = "bold",
+      hjust = 0
+    ),
+    plot.subtitle = element_text(
+      size = 10,
+      hjust = 0
+    ),
+    plot.margin = margin(5, 5, 5, 5),
+    legend.position = "right"
+  )
+
+##----------------------------------------------------------
+## 6. Helper: return the selected window
+##----------------------------------------------------------
+
+get_window_data <- function(
+    data,
+    window_start
+) {
+  
+  data %>%
+    filter(
+      Window_start == window_start
+    )
+}
+
+##----------------------------------------------------------
+## 7. Helper: select top X connections
+##----------------------------------------------------------
+
+get_top_connections <- function(
+    data,
+    top_n
+) {
+  
+  if (is.null(data) || nrow(data) == 0) {
+    return(data)
+  }
+  
+  number_to_keep <- min(
+    as.integer(top_n),
+    nrow(data)
+  )
+  
+  data %>%
+    arrange(
+      desc(Correlation),
+      desc(N_paired_years)
+    ) %>%
+    slice_head(
+      n = number_to_keep
+    )
+}
+
+##----------------------------------------------------------
+## 8. Helper: construct node data
+##----------------------------------------------------------
+
+build_node_data <- function(edge_data) {
+  
+  if (is.null(edge_data) || nrow(edge_data) == 0) {
+    return(tibble())
+  }
+  
+  city1_nodes <- edge_data %>%
+    transmute(
+      City = City1,
+      State = State1,
+      lat = lat1,
+      long = long1,
+      Avg_Pure_price = Avg_Pure_price1
+    )
+  
+  city2_nodes <- edge_data %>%
+    transmute(
+      City = City2,
+      State = State2,
+      lat = lat2,
+      long = long2,
+      Avg_Pure_price = Avg_Pure_price2
+    )
+  
+  degree_data <- edge_data %>%
+    select(
+      City1,
+      City2
+    ) %>%
+    pivot_longer(
+      cols = c(City1, City2),
+      names_to = "city_position",
+      values_to = "City"
+    ) %>%
+    count(
+      City,
+      name = "Degree"
+    )
+  
+  bind_rows(
+    city1_nodes,
+    city2_nodes
+  ) %>%
+    group_by(
+      City,
+      State
+    ) %>%
+    summarise(
+      lat = first(lat),
+      long = first(long),
+      Avg_Pure_price = first(Avg_Pure_price),
+      .groups = "drop"
+    ) %>%
+    left_join(
+      degree_data,
+      by = "City"
+    )
+}
+
+##----------------------------------------------------------
+## 9. General network map
+##----------------------------------------------------------
+
+plot_network_map <- function(
+    edge_data,
+    title_text,
+    subtitle_text = NULL,
+    focus_city = NULL
+) {
+  
+  if (is.null(edge_data) || nrow(edge_data) == 0) {
+    return(NULL)
+  }
+  
+  node_data <- build_node_data(edge_data)
+  
+  node_data <- node_data %>%
+    mutate(
+      Focus_city = if (
+        is.null(focus_city) ||
+        length(focus_city) == 0 ||
+        is.na(focus_city) ||
+        focus_city == ""
+      ) {
+        FALSE
+      } else {
+        City == focus_city
+      }
+    )
+  
+  ggplot() +
+    geom_polygon(
+      data = world_sub,
+      aes(
+        x = long,
+        y = lat,
+        group = group
+      ),
+      fill = "grey95",
+      color = "grey70",
+      linewidth = 0.3
+    ) +
+    geom_polygon(
+      data = us_map,
+      aes(
+        x = long,
+        y = lat,
+        group = group
+      ),
+      fill = NA,
+      color = "grey65",
+      linewidth = 0.35
+    ) +
+    geom_curve(
+      data = edge_data,
+      aes(
+        x = long1,
+        y = lat1,
+        xend = long2,
+        yend = lat2,
+        linewidth = abs(Correlation),
+        alpha = abs(Correlation),
+        color = Correlation
+      ),
+      curvature = 0.08
+    ) +
+    geom_point(
+      data = node_data,
+      aes(
+        x = long,
+        y = lat,
+        size = Avg_Pure_price,
+        fill = Focus_city
+      ),
+      shape = 21,
+      color = "black",
+      stroke = 0.3,
+      alpha = 0.9
+    ) +
+    coord_fixed(
+      ratio = 1.3,
+      xlim = c(-125, -66),
+      ylim = c(24, 50)
+    ) +
+    scale_color_gradient2(
+      low = "#B2182B",
+      mid = "grey80",
+      high = "#2166AC",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = "Correlation"
+    ) +
+    scale_linewidth(
+      range = c(0.25, 1.25),
+      guide = "none"
+    ) +
+    scale_alpha(
+      range = c(0.35, 0.9),
+      guide = "none"
+    ) +
+    scale_size_continuous(
+      range = c(2, 7),
+      name = "Average price"
+    ) +
+    scale_fill_manual(
+      values = c(
+        "FALSE" = "white",
+        "TRUE" = "#FFD700"
+      ),
+      guide = "none"
+    ) +
+    labs(
+      title = title_text,
+      subtitle = subtitle_text,
+      x = NULL,
+      y = NULL
+    ) +
+    base_theme
+}
+
+##----------------------------------------------------------
+## 10. Shiny user interface
+##----------------------------------------------------------
+
+ui <- fluidPage(
+  
+  titlePanel(
+    "Rolling Cocaine Price Correlation Networks"
+  ),
+  
+  sidebarLayout(
+    
+    sidebarPanel(
+      
+      sliderInput(
+        inputId = "window_start",
+        label = "Rolling-window start year:",
+        min = minimum_window_start,
+        max = maximum_window_start,
+        value = minimum_window_start,
+        step = 1,
+        sep = ""
+      ),
+      
+      textOutput(
+        outputId = "selected_window_text"
+      ),
+      
+      tags$br(),
+      
+      sliderInput(
+        inputId = "top_n",
+        label = "Top X connections to show:",
+        min = 1,
+        max = 100,
+        value = 30,
+        step = 1
+      ),
+      
+      selectInput(
+        inputId = "state",
+        label = "State:",
+        choices = c(
+          "National",
+          state.abb
+        ),
+        selected = "National"
+      ),
+      
+      checkboxInput(
+        inputId = "limit_city_choices",
+        label = paste(
+          "Limit city choices to cities appearing",
+          "in the selected top connections"
+        ),
+        value = TRUE
+      ),
+      
+      selectInput(
+        inputId = "focus_city",
+        label = "Focus city:",
+        choices = NULL
+      ),
+      
+      tags$br(),
+      
+      helpText(
+        paste(
+          "Connections are ranked from highest to lowest",
+          "Pearson correlation."
+        )
+      ),
+      
+      helpText(
+        paste(
+          "Only city pairs with at least 10 common years",
+          "are included."
+        )
+      ),
+      
+      helpText(
+        paste(
+          "Node size represents average Pure_price",
+          "over the selected window."
+        )
+      )
+    ),
+    
+    mainPanel(
+      
+      tabsetPanel(
+        
+        tabPanel(
+          "National network",
+          plotOutput(
+            outputId = "national_plot",
+            height = "700px"
+          )
+        ),
+        
+        tabPanel(
+          "State network",
+          plotOutput(
+            outputId = "state_plot",
+            height = "700px"
+          )
+        ),
+        
+        tabPanel(
+          "City network",
+          plotOutput(
+            outputId = "city_plot",
+            height = "700px"
+          )
+        ),
+        
+        tabPanel(
+          "Connection data",
+          tableOutput(
+            outputId = "connection_table"
+          )
+        )
+      )
+    )
+  )
+)
+
+##----------------------------------------------------------
+## 11. Shiny server
+##----------------------------------------------------------
+
+server <- function(input, output, session) {
+  
+  ##--------------------------------------------------------
+  ## Selected rolling window
+  ##--------------------------------------------------------
+  
+  selected_window <- reactive({
+    
+    req(input$window_start)
+    
+    get_window_data(
+      data = rolling_correlations,
+      window_start = input$window_start
+    )
+  })
+  
+  selected_window_label <- reactive({
+    
+    window_data <- selected_window()
+    
+    if (nrow(window_data) == 0) {
+      return("")
+    }
+    
+    unique(window_data$Window_label)[1]
+  })
+  
+  output$selected_window_text <- renderText({
+    
+    paste0(
+      "Selected window: ",
+      selected_window_label()
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## Update maximum number of connections
+  ##--------------------------------------------------------
+  
+  observe({
+    
+    window_data <- selected_window()
+    
+    req(nrow(window_data) > 0)
+    
+    new_maximum <- nrow(window_data)
+    
+    new_value <- min(
+      isolate(input$top_n),
+      new_maximum
+    )
+    
+    updateSliderInput(
+      session = session,
+      inputId = "top_n",
+      max = new_maximum,
+      value = new_value
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## National top connections
+  ##--------------------------------------------------------
+  
+  national_edges <- reactive({
+    
+    window_data <- selected_window()
+    
+    get_top_connections(
+      data = window_data,
+      top_n = input$top_n
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## State data
+  ##
+  ## State filtering occurs before selecting top X.
+  ## Thus, it shows the top X connections involving that
+  ## state, rather than state connections surviving a
+  ## national top-X filter.
+  ##--------------------------------------------------------
+  
+  state_edges <- reactive({
+    
+    req(input$state)
+    req(input$state != "National")
+    
+    state_data <- selected_window() %>%
+      filter(
+        State1 == input$state |
+          State2 == input$state
+      )
+    
+    get_top_connections(
+      data = state_data,
+      top_n = input$top_n
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## Update focus-city choices
+  ##--------------------------------------------------------
+  
+  observe({
+    
+    window_data <- selected_window()
+    
+    if (isTRUE(input$limit_city_choices)) {
+      city_source <- national_edges()
+    } else {
+      city_source <- window_data
+    }
+    
+    cities <- sort(
+      unique(
+        c(
+          city_source$City1,
+          city_source$City2
+        )
+      )
+    )
+    
+    cities <- cities[
+      !is.na(cities) &
+        cities != ""
+    ]
+    
+    previous_city <- isolate(input$focus_city)
+    
+    selected_city <- if (
+      !is.null(previous_city) &&
+      previous_city %in% cities
+    ) {
+      previous_city
+    } else if (length(cities) > 0) {
+      cities[1]
+    } else {
+      character(0)
+    }
+    
+    updateSelectInput(
+      session = session,
+      inputId = "focus_city",
+      choices = cities,
+      selected = selected_city
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## City-specific connections
+  ##
+  ## Filtering for the focus city occurs first, followed by
+  ## selecting that city's top X connections.
+  ##--------------------------------------------------------
+  
+  city_edges <- reactive({
+    
+    req(input$focus_city)
+    
+    city_data <- selected_window() %>%
+      filter(
+        City1 == input$focus_city |
+          City2 == input$focus_city
+      )
+    
+    get_top_connections(
+      data = city_data,
+      top_n = input$top_n
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## National plot
+  ##--------------------------------------------------------
+  
+  output$national_plot <- renderPlot({
+    
+    edges <- national_edges()
+    
+    validate(
+      need(
+        nrow(edges) > 0,
+        "No connections are available for this window."
+      )
+    )
+    
+    plot_network_map(
+      edge_data = edges,
+      title_text = paste0(
+        "Top ",
+        nrow(edges),
+        " national connections"
+      ),
+      subtitle_text = paste0(
+        "Rolling window: ",
+        selected_window_label()
+      )
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## State plot
+  ##--------------------------------------------------------
+  
+  output$state_plot <- renderPlot({
+    
+    validate(
+      need(
+        input$state != "National",
+        "Select a state from the sidebar."
+      )
+    )
+    
+    edges <- state_edges()
+    
+    validate(
+      need(
+        nrow(edges) > 0,
+        paste0(
+          "No connections are available for ",
+          input$state,
+          " in this window."
+        )
+      )
+    )
+    
+    plot_network_map(
+      edge_data = edges,
+      title_text = paste0(
+        "Top ",
+        nrow(edges),
+        " connections involving ",
+        input$state
+      ),
+      subtitle_text = paste0(
+        "Rolling window: ",
+        selected_window_label()
+      )
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## City-specific plot
+  ##--------------------------------------------------------
+  
+  output$city_plot <- renderPlot({
+    
+    req(input$focus_city)
+    
+    edges <- city_edges()
+    
+    validate(
+      need(
+        nrow(edges) > 0,
+        paste0(
+          "No connections are available for ",
+          input$focus_city,
+          " in this window."
+        )
+      )
+    )
+    
+    plot_network_map(
+      edge_data = edges,
+      title_text = paste0(
+        "Top ",
+        nrow(edges),
+        " connections for ",
+        input$focus_city
+      ),
+      subtitle_text = paste0(
+        "Rolling window: ",
+        selected_window_label()
+      ),
+      focus_city = input$focus_city
+    )
+  })
+  
+  ##--------------------------------------------------------
+  ## Data table
+  ##--------------------------------------------------------
+  
+  output$connection_table <- renderTable({
+    
+    national_edges() %>%
+      transmute(
+        Window = Window_label,
+        City1,
+        City2,
+        `Average price: City 1` = round(
+          Avg_Pure_price1,
+          2
+        ),
+        `Average price: City 2` = round(
+          Avg_Pure_price2,
+          2
+        ),
+        `Common years` = N_paired_years,
+        Correlation = round(
+          Correlation,
+          3
+        )
+      )
+  })
+}
+
+##----------------------------------------------------------
+## 12. Run application
+##----------------------------------------------------------
+
+shinyApp(
+  ui = ui,
+  server = server
+)

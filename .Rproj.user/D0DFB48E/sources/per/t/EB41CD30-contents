@@ -1,0 +1,1457 @@
+rm(list = ls())
+
+setwd("~/Dropbox/Stride_Detailed_Analysis/data/redo")
+
+library(igraph)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(stringr)
+
+# Correlation threshold
+corr_threshold <- 0.67
+
+# Number of random starts for the core-periphery optimization
+cp_restarts <- 100
+
+# Load data
+d_full <- read.csv("corr_price_redo.csv")
+d_pre  <- read.csv("corr_price_pre.csv")
+d_post <- read.csv("corr_price_post.csv")
+
+
+# ============================================================
+# Weighted Borgatti-Everett core-periphery model
+# ============================================================
+
+# This function maximizes the correlation between:
+#
+#   observed weighted adjacency matrix
+#
+# and the ideal core-periphery matrix:
+#
+#   core-core       = 1
+#   core-periphery  = 0
+#   periphery-core  = 0
+#   periphery-periphery = 0
+#
+# The algorithm uses multiple random starts and greedy node flipping.
+#
+# Important:
+# A correlation threshold is still used to define which edges enter
+# the network. The Borgatti-Everett model then uses the retained
+# correlations as weights.
+
+fit_weighted_be_core <- function(A,
+                                 n_restarts = 100,
+                                 max_iter = 1000,
+                                 min_core_size = 1,
+                                 max_core_size = nrow(A) - 1,
+                                 seed = 123) {
+  
+  set.seed(seed)
+  
+  A <- as.matrix(A)
+  A[is.na(A)] <- 0
+  diag(A) <- 0
+  
+  n <- nrow(A)
+  
+  if (n < 3) {
+    stop("At least three nodes are required.")
+  }
+  
+  # Symmetrize the matrix. This is appropriate because correlations
+  # are symmetric. If your data contain genuinely directed edges,
+  # this model should not be applied to the directed graph.
+  A <- (A + t(A)) / 2
+  diag(A) <- 0
+  
+  # Scale weights between 0 and 1.
+  max_A <- max(A, na.rm = TRUE)
+  
+  if (!is.finite(max_A) || max_A <= 0) {
+    stop("The adjacency matrix contains no positive edge weights.")
+  }
+  
+  W <- A / max_A
+  
+  # Use only the upper triangle so that each undirected edge is counted once.
+  upper_index <- upper.tri(W)
+  observed <- W[upper_index]
+  
+  # Objective:
+  # Pearson correlation between observed edge weights and the ideal
+  # core-periphery structure.
+  objective <- function(core_membership) {
+    
+    ideal <- outer(
+      core_membership,
+      core_membership,
+      FUN = "*"
+    )
+    
+    ideal_values <- ideal[upper_index]
+    
+    # Correlation is undefined if all ideal values are identical.
+    if (sd(ideal_values) == 0 || sd(observed) == 0) {
+      return(-Inf)
+    }
+    
+    cor(observed, ideal_values, use = "complete.obs")
+  }
+  
+  # Enforce a minimum and maximum number of core nodes.
+  valid_membership <- function(x) {
+    sum(x) >= min_core_size &&
+      sum(x) <= max_core_size
+  }
+  
+  best_score <- -Inf
+  best_membership <- NULL
+  
+  for (restart in seq_len(n_restarts)) {
+    
+    # Random initial allocation, subject to minimum/maximum core size
+    initial_core_size <- sample(
+      min_core_size:max_core_size,
+      size = 1
+    )
+    
+    membership <- rep(0L, n)
+    membership[
+      sample(seq_len(n), initial_core_size)
+    ] <- 1L
+    
+    current_score <- objective(membership)
+    improved <- TRUE
+    iteration <- 0
+    
+    while (improved && iteration < max_iter) {
+      
+      improved <- FALSE
+      iteration <- iteration + 1
+      
+      # Randomly inspect nodes to avoid a deterministic search order
+      node_order <- sample(seq_len(n))
+      
+      for (i in node_order) {
+        
+        proposal <- membership
+        proposal[i] <- 1L - proposal[i]
+        
+        if (!valid_membership(proposal)) {
+          next
+        }
+        
+        proposal_score <- objective(proposal)
+        
+        if (is.finite(proposal_score) &&
+            proposal_score > current_score) {
+          
+          membership <- proposal
+          current_score <- proposal_score
+          improved <- TRUE
+        }
+      }
+    }
+    
+    if (is.finite(current_score) &&
+        current_score > best_score) {
+      
+      best_score <- current_score
+      best_membership <- membership
+    }
+  }
+  
+  if (is.null(best_membership)) {
+    stop("The core-periphery optimization failed.")
+  }
+  
+  # Label the group with membership 1 as the core.
+  # The optimization has already defined this group.
+  core_membership <- best_membership
+  
+  # Calculate a node-level core score.
+  #
+  # This is not the original B&E fit statistic. It is a useful
+  # descriptive score: each node's weighted connection to the
+  # estimated core, normalized by its maximum possible value.
+  core_nodes <- which(core_membership == 1)
+  
+  core_score <- rowSums(W[, core_nodes, drop = FALSE])
+  
+  if (length(core_nodes) > 0) {
+    core_score <- core_score / length(core_nodes)
+  }
+  
+  list(
+    membership = core_membership,
+    core_score = core_score,
+    fit = best_score,
+    ideal_matrix = outer(
+      core_membership,
+      core_membership,
+      FUN = "*"
+    ),
+    observed_matrix = W
+  )
+}
+
+
+# ============================================================
+# Function to compute all metrics for one dataset
+# ============================================================
+
+compute_network_metrics <- function(d,
+                                    period_label,
+                                    corr_threshold = 0.67,
+                                    cp_restarts = 100,
+                                    cp_seed = 123) {
+  
+  # Keep only sufficiently strong positive correlations
+  d <- d %>%
+    filter(
+      !is.na(Correlation),
+      Correlation > corr_threshold
+    )
+  
+  if (nrow(d) == 0) {
+    stop(
+      paste(
+        "No edges remain for period:",
+        period_label
+      )
+    )
+  }
+  
+  # Create a consistent undirected edge orientation
+  d$from <- ifelse(
+    d$Avg_site_id1 < d$Avg_site_id2,
+    as.character(d$City1),
+    as.character(d$City2)
+  )
+  
+  d$to <- ifelse(
+    d$Avg_site_id1 < d$Avg_site_id2,
+    as.character(d$City2),
+    as.character(d$City1)
+  )
+  
+  # Make sure duplicate city pairs are handled consistently
+  d <- d %>%
+    group_by(from, to) %>%
+    summarise(
+      Correlation = mean(Correlation, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Create the graph.
+  #
+  # Since correlations are symmetric, an undirected graph is the
+  # most appropriate representation for the core-periphery model.
+  g_und <- graph_from_data_frame(
+    d[, c("from", "to", "Correlation")],
+    directed = FALSE
+  )
+  
+  E(g_und)$weight <- E(g_und)$Correlation
+  
+  # Add any cities that occur in the data but happen to have no
+  # surviving edge after thresholding.
+  all_cities <- sort(unique(c(
+    as.character(d$from),
+    as.character(d$to)
+  )))
+  
+  missing_cities <- setdiff(all_cities, V(g_und)$name)
+  
+  if (length(missing_cities) > 0) {
+    g_und <- add_vertices(
+      g_und,
+      nv = length(missing_cities),
+      name = missing_cities
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # Directed metrics
+  #
+  # Your original data are correlations, so direction is artificial
+  # here. We retain the directed metrics for compatibility with your
+  # original code, but these should not be interpreted as causal
+  # in-degree or out-degree.
+  # ------------------------------------------------------------
+  
+  g <- as.directed(g_und, mode = "arbitrary")
+  
+  indeg <- degree(g, mode = "in")
+  outdeg <- degree(g, mode = "out")
+  
+  instr <- strength(
+    g,
+    mode = "in",
+    weights = E(g)$weight
+  )
+  
+  outstr <- strength(
+    g,
+    mode = "out",
+    weights = E(g)$weight
+  )
+  
+  mean_in_corr <- ifelse(
+    indeg > 0,
+    instr / indeg,
+    NA_real_
+  )
+  
+  mean_out_corr <- ifelse(
+    outdeg > 0,
+    outstr / outdeg,
+    NA_real_
+  )
+  
+  tot_deg <- indeg + outdeg
+  tot_str <- instr + outstr
+  
+  mean_corr_all <- ifelse(
+    tot_deg > 0,
+    tot_str / tot_deg,
+    NA_real_
+  )
+  
+  # Correlations are positive after thresholding, so 1/correlation
+  # can be used as a distance for path-based measures.
+  dist_w <- 1 / E(g)$weight
+  
+  closen_in <- closeness(
+    g,
+    mode = "in",
+    weights = dist_w,
+    normalized = TRUE
+  )
+  
+  closen_out <- closeness(
+    g,
+    mode = "out",
+    weights = dist_w,
+    normalized = TRUE
+  )
+  
+  betw <- betweenness(
+    g,
+    directed = TRUE,
+    weights = dist_w,
+    normalized = TRUE
+  )
+  
+  eig_in <- eigen_centrality(
+    g,
+    directed = TRUE,
+    scale = TRUE,
+    weights = E(g)$weight
+  )$vector
+  
+  auth <- authority.score(
+    g,
+    weights = E(g)$weight
+  )$vector
+  
+  hub <- hub.score(
+    g,
+    weights = E(g)$weight
+  )$vector
+  
+  # ------------------------------------------------------------
+  # Ordinary unweighted coreness
+  # ------------------------------------------------------------
+  
+  core_num <- coreness(
+    g_und,
+    mode = "all"
+  )
+  
+  # ------------------------------------------------------------
+  # Weighted Borgatti-Everett model
+  # ------------------------------------------------------------
+  
+  adjacency_matrix <- as.matrix(
+    as_adjacency_matrix(
+      g_und,
+      attr = "weight",
+      sparse = FALSE
+    )
+  )
+  
+  # Ensure matrix order agrees with all output vectors
+  node_names <- V(g_und)$name
+  rownames(adjacency_matrix) <- node_names
+  colnames(adjacency_matrix) <- node_names
+  
+  cp_fit <- fit_weighted_be_core(
+    A = adjacency_matrix,
+    n_restarts = cp_restarts,
+    seed = cp_seed
+  )
+  
+  cp_membership <- cp_fit$membership
+  names(cp_membership) <- node_names
+  
+  cp_score <- cp_fit$core_score
+  names(cp_score) <- node_names
+  
+  # The optimization labels the group with value 1 as the core.
+  core_flag <- ifelse(
+    cp_membership == 1,
+    "core",
+    "periphery"
+  )
+  
+  names(core_flag) <- node_names
+  
+  # Return a data frame with all metrics
+  result <- data.frame(
+    period = period_label,
+    City = node_names,
+    indegree = as.numeric(indeg[node_names]),
+    outdegree = as.numeric(outdeg[node_names]),
+    instrength = as.numeric(instr[node_names]),
+    outstrength = as.numeric(outstr[node_names]),
+    mean_in_corr = as.numeric(mean_in_corr[node_names]),
+    mean_out_corr = as.numeric(mean_out_corr[node_names]),
+    mean_corr_all = as.numeric(mean_corr_all[node_names]),
+    closeness_in = as.numeric(closen_in[node_names]),
+    closeness_out = as.numeric(closen_out[node_names]),
+    betweenness = as.numeric(betw[node_names]),
+    eigen_in = as.numeric(eig_in[node_names]),
+    hub = as.numeric(hub[node_names]),
+    authority = as.numeric(auth[node_names]),
+    coreness = as.numeric(core_num[node_names]),
+    
+    # Borgatti-Everett outputs
+    be_membership = as.integer(cp_membership[node_names]),
+    be_core_score = as.numeric(cp_score[node_names]),
+    be_core_flag = as.character(core_flag[node_names]),
+    
+    # Network-level model fit, repeated for convenient export
+    be_fit = cp_fit$fit,
+    
+    row.names = NULL
+  )
+  
+  return(result)
+}
+
+
+# ============================================================
+# Run the analysis
+# ============================================================
+
+res_all <- compute_network_metrics(
+  d_full,
+  "full",
+  corr_threshold = corr_threshold,
+  cp_restarts = cp_restarts,
+  cp_seed = 101
+)
+
+res_pre <- compute_network_metrics(
+  d_pre,
+  "pre",
+  corr_threshold = corr_threshold,
+  cp_restarts = cp_restarts,
+  cp_seed = 102
+)
+
+res_post <- compute_network_metrics(
+  d_post,
+  "post",
+  corr_threshold = corr_threshold,
+  cp_restarts = cp_restarts,
+  cp_seed = 103
+)
+
+res_long <- bind_rows(
+  res_all,
+  res_pre,
+  res_post
+)
+
+
+# ============================================================
+# Keep cities observed in all three periods
+# ============================================================
+
+common_cities <- Reduce(
+  intersect,
+  list(
+    res_all$City,
+    res_pre$City,
+    res_post$City
+  )
+)
+
+res_long <- res_long %>%
+  filter(City %in% common_cities)
+
+
+# ============================================================
+# Changes in betweenness
+# ============================================================
+
+betw_change <- res_long %>%
+  select(period, City, betweenness) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = betweenness
+  ) %>%
+  mutate(
+    delta_early_all = pre - full,
+    delta_late_all = post - full,
+    delta_late_early = post - pre
+  )
+
+
+# ============================================================
+# Rank changes and core-periphery roles
+# ============================================================
+
+role_change <- res_long %>%
+  select(
+    period,
+    City,
+    be_core_flag,
+    be_core_score,
+    be_fit,
+    hub,
+    authority,
+    mean_in_corr,
+    mean_out_corr,
+    mean_corr_all
+  ) %>%
+  group_by(period) %>%
+  mutate(
+    hub_rank = rank(
+      -hub,
+      ties.method = "min"
+    ),
+    auth_rank = rank(
+      -authority,
+      ties.method = "min"
+    ),
+    be_core_score_rank = rank(
+      -be_core_score,
+      ties.method = "min"
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(City, period)
+
+
+# ============================================================
+# Pivot results across periods
+# ============================================================
+
+# Pivot to compare across periods (centrality and correlations)
+role_pivot <- role_change %>%
+  select(
+    City, period,
+    be_core_flag, hub_rank, auth_rank,
+    mean_in_corr, mean_out_corr, mean_corr_all
+  ) %>%
+  rename(
+    core_flag = be_core_flag
+  ) %>%
+  pivot_wider(
+    names_from  = period,
+    values_from = c(
+      core_flag,
+      hub_rank, auth_rank,
+      mean_in_corr, mean_out_corr, mean_corr_all
+    ),
+    names_sep = "_"
+  )
+
+#########################
+# TABLES FOR DESCRIPTIVES
+#########################
+
+role_pivot <- role_pivot %>%
+  mutate(
+    always_core = if_else(
+      core_flag_post == "core" &
+        core_flag_pre == "core",
+      1,
+      0
+    ), # Always in core
+    
+    always_periphery = if_else(
+      core_flag_post == "periphery" &
+        core_flag_pre == "periphery",
+      1,
+      0
+    ), # Always in periphery
+    
+    enter_core = if_else(
+      core_flag_post == "core" &
+        core_flag_pre == "periphery",
+      1,
+      0
+    ), # Enters core
+    
+    enter_periphery = if_else(
+      core_flag_post == "periphery" &
+        core_flag_pre == "core",
+      1,
+      0
+    )  # Enters periphery
+  )
+
+# Add degree counts to the long and wide role tables
+role_change <- role_change %>%
+  left_join(
+    res_long %>% select(City, period, indegree, outdegree),
+    by = c("City", "period")
+  )
+
+role_pivot <- role_pivot %>%
+  left_join(
+    role_change %>%
+      select(City, period, indegree, outdegree) %>%
+      pivot_wider(
+        names_from = period,
+        values_from = c(indegree, outdegree)
+      ),
+    by = "City"
+  )
+
+# Export the complete role-change data
+write.csv(role_change, "role_change.csv", row.names = FALSE)
+write.csv(role_pivot, "role_change_wide.csv", row.names = FALSE)
+
+
+# function to create assignments
+make_role_table <- function(df, title) {
+  table_data <- df %>%
+    arrange(hub_rank_pre) %>%
+    transmute(
+      City,
+      degree_pre = indegree_pre + outdegree_pre,
+      degree_post = indegree_post + outdegree_post,
+      mean_corr_pre = mean_corr_all_pre,
+      mean_corr_post = mean_corr_all_post
+    ) %>%
+    arrange(desc(degree_pre), City)  %>%
+    mutate(across(starts_with("mean_corr"), ~ round(.x, 3)))
+  
+  filename <- gsub(" ", "_", tolower(title))
+  write.csv(table_data, paste0(filename, ".csv"), row.names = FALSE)
+  
+  tab <- table_data %>%
+    kbl(
+      format = "latex",
+      booktabs = TRUE,
+      digits = c(0, 0, 0, 3, 3),
+      col.names = c(
+        "City", "Degree ()", "Degree (post)",
+        "Mean corr. (pre)", "Mean corr. (post)"
+      ),
+      caption = title,
+      align = c("l", rep("r", 4)),
+      escape = TRUE
+    ) %>%
+    kable_styling(
+      latex_options = "hold_position",
+      full_width = FALSE,
+      position = "center"
+    ) %>%
+    footnote(
+      general = paste0(
+        "Degree counts undirected connections with correlation above ",
+        corr_threshold,
+        ". Mean correlation is the average over retained connections. ",
+        "Core status is estimated separately by period using the weighted ",
+        "core-periphery model. The sample includes cities observed in all ",
+        "three periods."
+      ),
+      general_title = "Notes: ",
+      threeparttable = TRUE
+    )
+  
+  
+  writeLines(as.character(tab), paste0(filename, ".tex"))
+  tab
+}
+
+
+
+# 1. Always core
+tab_always_core <- role_pivot %>%
+  filter(always_core == 1) %>%
+  make_role_table(
+    title = "Always Core Cities"
+  )
+
+# 2. Always periphery
+tab_always_periphery <- role_pivot %>%
+  filter(always_periphery == 1) %>%
+  make_role_table(
+    title = "Always Periphery Cities"
+  )
+
+# 3. Enter core
+tab_enter_core <- role_pivot %>%
+  filter(enter_core == 1) %>%
+  make_role_table(
+    title = "Entering Core Cities"
+  )
+
+# 4. Enter periphery
+tab_enter_periphery <- role_pivot %>%
+  filter(enter_periphery == 1) %>%
+  make_role_table(
+    title = "Entering Periphery Cities"
+  )
+
+
+# print the tables
+tab_always_core
+tab_always_periphery
+tab_enter_core
+tab_enter_periphery
+
+
+################################
+# Create maps of these locations
+################################
+
+# load geo data
+# load lat and long for cities
+city_geo <- read.csv(
+  "/Users/alexkucera/Dropbox/Stride_Detailed_Analysis/margret_initial_analysis/locations_with_coords.csv"
+)
+
+city_geo <- city_geo %>%
+  mutate(
+    mylocations = mylocations %>%
+      str_squish() %>%                     # trim and collapse spaces
+      str_replace("\\s*,\\s*", " ")       # enforce exactly ", " between city and state
+  )
+
+city_geo <- na.omit(city_geo)
+
+
+#=======================
+# join geo with res dfs
+#=======================
+
+res_all <- res_all %>%
+  left_join(
+    city_geo,
+    by = c("City" = "mylocations")
+  )
+
+res_pre <- res_pre %>%
+  left_join(
+    city_geo,
+    by = c("City" = "mylocations")
+  )
+
+res_post <- res_post %>%
+  left_join(
+    city_geo,
+    by = c("City" = "mylocations")
+  )
+
+
+# Maintain the original core_flag naming convention
+# for later mapping code.
+res_all <- res_all %>%
+  mutate(
+    core_flag = be_core_flag
+  )
+
+res_pre <- res_pre %>%
+  mutate(
+    core_flag = be_core_flag
+  )
+
+res_post <- res_post %>%
+  mutate(
+    core_flag = be_core_flag
+  )
+
+
+#---------------------------------
+# Base map objects
+#---------------------------------
+
+library(tigris)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(maps)
+
+world_map <- map_data("world")
+
+lon_min <- -125
+lon_max <- -60
+lat_min <- 20
+lat_max <- 50
+
+world_sub <- world_map %>%
+  filter(
+    long >= lon_min,
+    long <= lon_max,
+    lat >= lat_min,
+    lat <= lat_max
+  )
+
+us_map <- map_data("state")
+
+base_theme <- theme_minimal(
+  base_family = "Times New Roman"
+) +
+  theme(
+    panel.border     = element_rect(
+      color = "black",
+      fill = NA,
+      linewidth = 0.5
+    ),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text        = element_blank(),
+    axis.ticks       = element_blank(),
+    axis.title       = element_blank(),
+    plot.title       = element_text(
+      size = 12,
+      face = "bold",
+      hjust = 0
+    ),
+    plot.subtitle    = element_text(
+      size = 10,
+      hjust = 0
+    ),
+    plot.margin      = margin(5, 5, 5, 5)
+  )
+
+
+#------------------------------------------
+# Map based on role changes across samples
+#------------------------------------------
+library(tigris)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(maps)
+
+
+#---------------------------------
+# Prepare role_pivot + coords
+#---------------------------------
+
+role_pivot <- role_pivot %>%
+  left_join(
+    city_geo,
+    by = c("City" = "mylocations")
+  )
+
+
+role_map <- role_pivot %>%
+  mutate(
+    role = case_when(
+      always_core      == 1 ~ "Always core",
+      always_periphery == 1 ~ "Always periphery",
+      enter_core       == 1 ~ "Enter core",
+      enter_periphery  == 1 ~ "Enter periphery",
+      TRUE                 ~ "Other"
+    ),
+    role = factor(
+      role,
+      levels = c(
+        "Always core",
+        "Always periphery",
+        "Enter core",
+        "Enter periphery",
+        "Other"
+      )
+    )
+  )
+
+role_map <- role_map %>%
+  filter(role != "Other")
+
+
+#---------------------------------
+# Plot: roles on the map
+#---------------------------------
+
+#########
+# Core
+#########
+
+res_core_post <- res_post %>%
+  filter(core_flag == "core")
+
+res_core_pre <- res_pre %>%
+  filter(core_flag == "core")
+
+
+#########
+# Periphery
+#########
+
+res_perf_post <- res_post %>%
+  filter(core_flag == "periphery")
+
+res_perf_pre <- res_pre %>%
+  filter(core_flag == "periphery")
+
+#=========================================
+# Maps 
+#=========================================
+
+
+
+#############################
+# Overlay interstate system
+#############################
+library(tigris)
+library(sf)
+
+primary_roads_us <- tigris::primary_roads(
+  year = 2023,
+  class = "sf"
+)
+
+primary_roads_us <- st_transform(primary_roads_us, 4326)
+
+interstates <- primary_roads_us %>%
+  filter(RTTYP == "I")
+interstates <- primary_roads_us %>%
+  filter(RTTYP == "I", !is.na(FULLNAME))
+
+map_bbox <- st_bbox(
+  c(
+    xmin = lon_min,
+    xmax = lon_max,
+    ymin = lat_min,
+    ymax = lat_max
+  ),
+  crs = st_crs(4326)
+)
+
+interstates_crop <- st_crop(interstates, map_bbox)
+
+
+
+
+library(units)
+library(ggrepel)
+
+# Examine the available interstate names
+sort(unique(interstates_crop$FULLNAME))
+
+# Use a projected CRS so distances are measured accurately
+interstate_lines_projected <- interstates_crop %>%
+  filter(
+    RTTYP == "I",
+    !is.na(FULLNAME)
+  ) %>%
+  mutate(
+    # Remove unnecessary spaces, e.g. "I- 80" becomes "I-80"
+    route_label = gsub("\\s+", "", FULLNAME)
+  ) %>%
+  st_transform(5070) %>%  # NAD83 / Conus Albers
+  group_by(route_label) %>%
+  summarise(
+    geometry = st_union(geometry),
+    .groups = "drop"
+  ) %>%
+  st_cast("LINESTRING")
+
+interstate_lines_projected <- interstate_lines_projected %>%
+  mutate(segment_length = st_length(geometry))
+
+# Number of labels based on approximately one label every 500 km
+interstate_lines_projected <- interstate_lines_projected %>%
+  mutate(
+    length_m = as.numeric(st_length(geometry)),
+    n_labels = pmax(1L, round(length_m / 100000))
+  )
+
+# Sample the calculated number of locations along each line
+label_geometry <- st_line_sample(
+  st_geometry(interstate_lines_projected),
+  n = interstate_lines_projected$n_labels,
+  type = "regular"
+)
+
+# Associate route names with the sampled locations
+interstate_labels <- st_sf(
+  route_label = interstate_lines_projected$route_label,
+  geometry = label_geometry,
+  crs = st_crs(interstate_lines_projected)
+) %>%
+  st_cast("POINT") %>%
+  st_transform(4326)
+
+
+geom_sf_label(
+  data = interstate_labels,
+  aes(label = route_label),
+  inherit.aes = FALSE,
+  size = 2.2,
+  color = "grey20",
+  fill = "white",
+  alpha = 0.85,
+  linewidth = 0.15,
+  label.padding = grid::unit(0.08, "lines"),
+  show.legend = FALSE
+)
+
+major_routes <- c(
+  "I-5", "I-10", "I-15", "I-20", "I-25",
+  "I-35", "I-40", "I-55", "I-65", "I-70",
+  "I-75", "I-80", "I-90", "I-94", "I-95"
+)
+
+interstate_labels_major <- interstate_labels %>%
+  filter(route_label %in% major_routes)
+
+
+#===========================
+# Map of full network
+#===========================
+
+library(scales)
+
+# Automatically determine the boundary between periphery and core
+core_threshold <- min(
+  res_all$coreness[res_all$core_flag == "core"],
+  na.rm = TRUE
+)
+
+# Determine observed score limits
+score_min <- min(res_all$coreness, na.rm = TRUE)
+score_max <- max(res_all$coreness, na.rm = TRUE)
+
+# Create a color position:
+# 0 = lowest periphery score
+# 0.5 = core/periphery boundary
+# 1 = highest core score
+res_all <- res_all %>%
+  mutate(
+    color_position = case_when(
+      coreness < core_threshold ~ rescale(
+        coreness,
+        to = c(0, 0.5),
+        from = c(score_min, core_threshold)
+      ),
+      
+      coreness >= core_threshold ~ rescale(
+        coreness,
+        to = c(0.5, 1),
+        from = c(core_threshold, score_max)
+      ),
+      
+      TRUE ~ NA_real_
+    )
+  )
+
+ggplot() +
+  geom_polygon(
+    data = world_sub,
+    aes(x = long, y = lat, group = group),
+    fill = "grey95",
+    color = "grey70",
+    linewidth = 0.3
+  ) +
+  
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    fill = NA,
+    color = "grey",
+    linewidth = 0.4
+  ) +
+  
+  geom_sf(
+    data = interstates_crop,
+    inherit.aes = FALSE,
+    color = "grey55",
+    linewidth = 0.25,
+    alpha = 0.55
+  ) +
+  
+  geom_sf_label(
+    data = interstate_labels_major,
+    aes(label = route_label),
+    inherit.aes = FALSE,
+    size = 3.2,
+    color = "white",
+    fill = "#1F4E79",
+    fontface = "bold",
+    alpha = 0.98,
+    linewidth = 0.4,
+    label.padding = grid::unit(0.14, "lines"),
+    label.r = grid::unit(0.08, "lines"),
+    show.legend = FALSE
+  ) +
+  
+  geom_point(
+    data = res_all,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = color_position
+    ),
+    size = 2,
+    alpha = 0.9
+  ) +
+  
+  scale_color_gradientn(
+    name = "Coreness score",
+    colours = c(
+      "#67001F",  # lowest periphery: dark burgundy
+      "#B2182B",  # low periphery: red
+      "#EF8A62",  # higher periphery: coral
+      "#D8C39A",  # core/periphery boundary: tan
+      "#67A9CF",  # lower core: light blue
+      "#2166AC",  # higher core: blue
+      "#053061"   # highest core: dark navy
+    ),
+    values = c(0, 0.20, 0.40, 0.50, 0.60, 0.80, 1),
+    limits = c(0, 1),
+    breaks = c(
+      0,
+      0.25,
+      0.5,
+      0.75,
+      1
+    ),
+    labels = c(
+      score_min,
+      round(score_min + (core_threshold - score_min) * 0.5, 1),
+      paste0("Boundary: ", core_threshold),
+      round(core_threshold + (score_max - core_threshold) * 0.5, 1),
+      score_max
+    ),
+    guide = guide_colorbar(
+      barheight = grid::unit(6, "cm"),
+      frame.colour = "grey40",
+      ticks.colour = "grey30"
+    )
+  ) +
+  
+  coord_sf(
+    xlim = c(lon_min, lon_max),
+    ylim = c(lat_min, lat_max),
+    crs = sf::st_crs(4326),
+    default_crs = sf::st_crs(4326),
+    expand = FALSE
+  ) +
+  
+  labs(
+    title = "Core–Periphery Full Sample",
+    x = NULL,
+    y = NULL
+  ) +
+  
+  base_theme +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+
+#===========================
+# Map of pre network
+#===========================
+
+
+# Automatically determine the boundary between periphery and core
+core_threshold <- min(
+  res_pre$coreness[res_pre$core_flag == "core"],
+  na.rm = TRUE
+)
+
+# Determine observed score limits
+score_min <- min(res_pre$coreness, na.rm = TRUE)
+score_max <- max(res_pre$coreness, na.rm = TRUE)
+
+# Create a color position:
+# 0 = lowest periphery score
+# 0.5 = core/periphery boundary
+# 1 = highest core score
+res_pre <- res_pre %>%
+  mutate(
+    color_position = case_when(
+      coreness < core_threshold ~ rescale(
+        coreness,
+        to = c(0, 0.5),
+        from = c(score_min, core_threshold)
+      ),
+      
+      coreness >= core_threshold ~ rescale(
+        coreness,
+        to = c(0.5, 1),
+        from = c(core_threshold, score_max)
+      ),
+      
+      TRUE ~ NA_real_
+    )
+  )
+
+ggplot() +
+  geom_polygon(
+    data = world_sub,
+    aes(x = long, y = lat, group = group),
+    fill = "grey95",
+    color = "grey70",
+    linewidth = 0.3
+  ) +
+  
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    fill = NA,
+    color = "grey",
+    linewidth = 0.4
+  ) +
+  
+  geom_sf(
+    data = interstates_crop,
+    inherit.aes = FALSE,
+    color = "grey55",
+    linewidth = 0.25,
+    alpha = 0.55
+  ) +
+  
+  geom_sf_label(
+    data = interstate_labels_major,
+    aes(label = route_label),
+    inherit.aes = FALSE,
+    size = 3.2,
+    color = "white",
+    fill = "#1F4E79",
+    fontface = "bold",
+    alpha = 0.98,
+    linewidth = 0.4,
+    label.padding = grid::unit(0.14, "lines"),
+    label.r = grid::unit(0.08, "lines"),
+    show.legend = FALSE
+  ) +
+  
+  geom_point(
+    data = res_pre,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = color_position
+    ),
+    size = 2,
+    alpha = 0.9
+  ) +
+  
+  scale_color_gradientn(
+    name = "Coreness score",
+    colours = c(
+      "#67001F",  # lowest periphery: dark burgundy
+      "#B2182B",  # low periphery: red
+      "#EF8A62",  # higher periphery: coral
+      "#D8C39A",  # core/periphery boundary: tan
+      "#67A9CF",  # lower core: light blue
+      "#2166AC",  # higher core: blue
+      "#053061"   # highest core: dark navy
+    ),
+    values = c(0, 0.20, 0.40, 0.50, 0.60, 0.80, 1),
+    limits = c(0, 1),
+    breaks = c(
+      0,
+      0.25,
+      0.5,
+      0.75,
+      1
+    ),
+    labels = c(
+      score_min,
+      round(score_min + (core_threshold - score_min) * 0.5, 1),
+      paste0("Boundary: ", core_threshold),
+      round(core_threshold + (score_max - core_threshold) * 0.5, 1),
+      score_max
+    ),
+    guide = guide_colorbar(
+      barheight = grid::unit(6, "cm"),
+      frame.colour = "grey40",
+      ticks.colour = "grey30"
+    )
+  ) +
+  
+  coord_sf(
+    xlim = c(lon_min, lon_max),
+    ylim = c(lat_min, lat_max),
+    crs = sf::st_crs(4326),
+    default_crs = sf::st_crs(4326),
+    expand = FALSE
+  ) +
+  
+  labs(
+    title = "Core–Periphery Pre Sample",
+    x = NULL,
+    y = NULL
+  ) +
+  
+  base_theme +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+
+
+#===========================
+# Map of post network
+#===========================
+
+
+# Automatically determine the boundary between periphery and core
+core_threshold <- min(
+  res_post$coreness[res_post$core_flag == "core"],
+  na.rm = TRUE
+)
+
+# Determine observed score limits
+score_min <- min(res_post$coreness, na.rm = TRUE)
+score_max <- max(res_post$coreness, na.rm = TRUE)
+
+# Create a color position:
+# 0 = lowest periphery score
+# 0.5 = core/periphery boundary
+# 1 = highest core score
+res_post <- res_post %>%
+  mutate(
+    color_position = case_when(
+      coreness < core_threshold ~ rescale(
+        coreness,
+        to = c(0, 0.5),
+        from = c(score_min, core_threshold)
+      ),
+      
+      coreness >= core_threshold ~ rescale(
+        coreness,
+        to = c(0.5, 1),
+        from = c(core_threshold, score_max)
+      ),
+      
+      TRUE ~ NA_real_
+    )
+  )
+
+ggplot() +
+  geom_polygon(
+    data = world_sub,
+    aes(x = long, y = lat, group = group),
+    fill = "grey95",
+    color = "grey70",
+    linewidth = 0.3
+  ) +
+  
+  geom_polygon(
+    data = us_map,
+    aes(x = long, y = lat, group = group),
+    fill = NA,
+    color = "grey",
+    linewidth = 0.4
+  ) +
+  
+  geom_sf(
+    data = interstates_crop,
+    inherit.aes = FALSE,
+    color = "grey55",
+    linewidth = 0.25,
+    alpha = 0.55
+  ) +
+  
+  geom_sf_label(
+    data = interstate_labels_major,
+    aes(label = route_label),
+    inherit.aes = FALSE,
+    size = 3.2,
+    color = "white",
+    fill = "#1F4E79",
+    fontface = "bold",
+    alpha = 0.98,
+    linewidth = 0.4,
+    label.padding = grid::unit(0.14, "lines"),
+    label.r = grid::unit(0.08, "lines"),
+    show.legend = FALSE
+  ) +
+  
+  geom_point(
+    data = res_post,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = color_position
+    ),
+    size = 2,
+    alpha = 0.9
+  ) +
+  
+  scale_color_gradientn(
+    name = "Coreness score",
+    colours = c(
+      "#67001F",  # lowest periphery: dark burgundy
+      "#B2182B",  # low periphery: red
+      "#EF8A62",  # higher periphery: coral
+      "#D8C39A",  # core/periphery boundary: tan
+      "#67A9CF",  # lower core: light blue
+      "#2166AC",  # higher core: blue
+      "#053061"   # highest core: dark navy
+    ),
+    values = c(0, 0.20, 0.40, 0.50, 0.60, 0.80, 1),
+    limits = c(0, 1),
+    breaks = c(
+      0,
+      0.25,
+      0.5,
+      0.75,
+      1
+    ),
+    labels = c(
+      score_min,
+      round(score_min + (core_threshold - score_min) * 0.5, 1),
+      paste0("Boundary: ", core_threshold),
+      round(core_threshold + (score_max - core_threshold) * 0.5, 1),
+      score_max
+    ),
+    guide = guide_colorbar(
+      barheight = grid::unit(6, "cm"),
+      frame.colour = "grey40",
+      ticks.colour = "grey30"
+    )
+  ) +
+  
+  coord_sf(
+    xlim = c(lon_min, lon_max),
+    ylim = c(lat_min, lat_max),
+    crs = sf::st_crs(4326),
+    default_crs = sf::st_crs(4326),
+    expand = FALSE
+  ) +
+  
+  labs(
+    title = "Core–Periphery Post Sample",
+    x = NULL,
+    y = NULL
+  ) +
+  
+  base_theme +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
